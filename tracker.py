@@ -1,31 +1,34 @@
+import json
+import os
+import uuid
+
 import streamlit as st
-from supabase import create_client
+
+DATA_FILE = "projects.json"
 
 
-@st.cache_resource
-def get_client():
-    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+def new_task(text):
+    return {"id": uuid.uuid4().hex[:8], "text": text, "done": False}
 
 
-sb = get_client()
+def load_projects():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "r") as f:
+        projects = json.load(f)
+    # older files have tasks without an id
+    for project in projects.values():
+        for task in project["tasks"]:
+            task.setdefault("id", uuid.uuid4().hex[:8])
+    return projects
 
 
-def get_projects():
-    return sb.table("projects").select("*").order("created_at").execute().data
+def save_projects(projects):
+    with open(DATA_FILE, "w") as f:
+        json.dump(projects, f, indent=2)
 
 
-def get_tasks(project_id):
-    return (
-        sb.table("tasks")
-        .select("*")
-        .eq("project_id", project_id)
-        .order("created_at")
-        .execute()
-        .data
-    )
-
-
-def stage_task():
+def add_new_task():
     text = st.session_state.task_input.strip()
     if text:
         st.session_state.new_tasks.append(text)
@@ -33,26 +36,20 @@ def stage_task():
 
 def save_new_project():
     name = st.session_state.new_name.strip()
+    saved = load_projects()
+
     if not name:
         st.session_state.new_msg = ("error", "The project needs a name.")
         return
-
-    try:
-        result = (
-            sb.table("projects")
-            .insert({"name": name, "description": st.session_state.new_desc})
-            .execute()
-        )
-    except Exception:
+    if name in saved:
         st.session_state.new_msg = ("error", "A project with that name already exists.")
         return
 
-    project_id = result.data[0]["id"]
-
-    if st.session_state.new_tasks:
-        sb.table("tasks").insert(
-            [{"project_id": project_id, "text": t} for t in st.session_state.new_tasks]
-        ).execute()
+    saved[name] = {
+        "description": st.session_state.new_desc,
+        "tasks": [new_task(t) for t in st.session_state.new_tasks],
+    }
+    save_projects(saved)
 
     st.session_state.new_tasks = []
     st.session_state.new_name = ""
@@ -64,6 +61,8 @@ if "new_tasks" not in st.session_state:
     st.session_state.new_tasks = []
 if "editing" not in st.session_state:
     st.session_state.editing = None
+
+projects = load_projects()
 
 st.title("Project Tracker")
 
@@ -78,7 +77,7 @@ with tab_new:
 
     with st.form("task_entry", clear_on_submit=True):
         st.text_input("Task (press Enter to add)", key="task_input")
-        st.form_submit_button("Add", on_click=stage_task)
+        st.form_submit_button("Add", on_click=add_new_task)
 
     for i, task in enumerate(st.session_state.new_tasks, 1):
         st.write(f"{i}. {task}")
@@ -96,25 +95,24 @@ with tab_new:
 # --- View and work on a project ---------------------------------------
 
 with tab_view:
-    projects = get_projects()
-
     if not projects:
         st.info("No projects yet. Create one in the other tab.")
     else:
-        by_name = {p["name"]: p for p in projects}
-        selected = st.selectbox("Project", list(by_name.keys()))
-        project = by_name[selected]
+        selected = st.selectbox("Project", list(projects.keys()))
+        project = projects[selected]
 
         st.write(project["description"])
 
-        tasks = get_tasks(project["id"])
-        total = len(tasks)
-        done = sum(t["done"] for t in tasks)
+        total = len(project["tasks"])
+        done = sum(t["done"] for t in project["tasks"])
 
         st.progress(done / total if total else 0.0)
         st.write(f"**{done}/{total}** done")
 
-        for task in tasks:
+        changed = False
+        delete_id = None
+
+        for task in project["tasks"]:
             tid = task["id"]
             left, mid, right = st.columns([8, 1, 1])
 
@@ -127,36 +125,39 @@ with tab_view:
                 )
                 if mid.button("✅", key=f"ok_{tid}", help="Save"):
                     if text.strip():
-                        sb.table("tasks").update({"text": text.strip()}).eq(
-                            "id", tid
-                        ).execute()
+                        task["text"] = text.strip()
+                        save_projects(projects)
                     st.session_state.editing = None
                     st.rerun()
                 if right.button("↩️", key=f"cancel_{tid}", help="Cancel"):
                     st.session_state.editing = None
                     st.rerun()
             else:
-                checked = left.checkbox(
-                    task["text"], value=task["done"], key=f"chk_{tid}"
-                )
+                checked = left.checkbox(task["text"], value=task["done"], key=f"chk_{tid}")
                 if checked != task["done"]:
-                    sb.table("tasks").update({"done": checked}).eq("id", tid).execute()
-                    st.rerun()
+                    task["done"] = checked
+                    changed = True
                 if mid.button("✏️", key=f"edit_btn_{tid}", help="Edit"):
                     st.session_state.editing = tid
                     st.rerun()
                 if right.button("🗑️", key=f"del_{tid}", help="Delete"):
-                    sb.table("tasks").delete().eq("id", tid).execute()
-                    st.rerun()
+                    delete_id = tid
+
+        if delete_id is not None:
+            project["tasks"] = [t for t in project["tasks"] if t["id"] != delete_id]
+            save_projects(projects)
+            st.rerun()
+
+        if changed:
+            save_projects(projects)
+            st.rerun()
 
         with st.form("add_existing_task", clear_on_submit=True):
-            text = st.text_input(
-                "Add a task", label_visibility="collapsed", placeholder="New task…"
-            )
+            text = st.text_input("Add a task", label_visibility="collapsed",
+                                 placeholder="New task…")
             added = st.form_submit_button("➕")
 
         if added and text.strip():
-            sb.table("tasks").insert(
-                {"project_id": project["id"], "text": text.strip()}
-            ).execute()
+            project["tasks"].append(new_task(text.strip()))
+            save_projects(projects)
             st.rerun()

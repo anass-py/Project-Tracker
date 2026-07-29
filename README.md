@@ -11,3 +11,4 @@ A Streamlit page where I track small tasks per project.
 
 pip install -r requirements.txt
 streamlit run app.py
+
